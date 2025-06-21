@@ -1,0 +1,107 @@
+<?php
+session_start();
+require_once 'config.php'; // Assurez-vous que ce fichier initialise l'objet $pdo
+
+// Activez l'affichage des erreurs pour le développement
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+$redirect_url = "inscription_formation_form.php"; // URL de redirection par défaut
+
+try {
+    // Vérification du Token CSRF (DOIT ÊTRE LA PREMIÈRE VÉRIFICATION)
+    if (!isset($_POST['csrf_token']) || !isset($_SESSION['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+        throw new Exception("Erreur de sécurité : Jeton CSRF invalide. Veuillez réessayer.");
+    }
+    // Détruire le token après utilisation pour éviter la réutilisation
+    unset($_SESSION['csrf_token']);
+
+    // Vérifier si le formulaire a été soumis
+    if (!isset($_POST['submit_enrollment'])) {
+        throw new Exception("Accès direct non autorisé. Veuillez utiliser le formulaire d'inscription.");
+    }
+
+    // Récupérer et nettoyer les données du formulaire
+    $user_id = isset($_POST['user_id']) ? (int)$_POST['user_id'] : (isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : null);
+    $name = trim($_POST['name'] ?? '');
+    $email = filter_var(trim($_POST['email'] ?? ''), FILTER_VALIDATE_EMAIL);
+    $formation_id = (int)($_POST['formation_id'] ?? 0);
+    $message = trim($_POST['message'] ?? '');
+
+    // Validation des données
+    if (empty($name) || empty($email) || $formation_id === 0) {
+        throw new Exception("Tous les champs obligatoires (Nom, Email, Formation) doivent être remplis.");
+    }
+    if ($email === false) {
+        throw new Exception("L'adresse email n'est pas valide.");
+    }
+
+    // Vérifier si la formation existe et est active, et récupérer son prix réel
+    $stmt_formation = $pdo->prepare("SELECT price FROM formations WHERE id = :formation_id AND status = 'Active'");
+    $stmt_formation->bindParam(':formation_id', $formation_id, PDO::PARAM_INT);
+    $stmt_formation->execute();
+    $formation = $stmt_formation->fetch(PDO::FETCH_ASSOC);
+
+    if (!$formation) {
+        throw new Exception("La formation sélectionnée n'est pas valide ou n'est plus disponible.");
+    }
+    $formation_price = $formation['price'];
+
+    // Vérifier si l'utilisateur est déjà inscrit à cette formation
+    $stmt_check_enrollment = $pdo->prepare("SELECT COUNT(*) FROM enrollments WHERE user_id = :user_id AND formation_id = :formation_id");
+    $stmt_check_enrollment->bindParam(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt_check_enrollment->bindParam(':formation_id', $formation_id, PDO::PARAM_INT);
+    $stmt_check_enrollment->execute();
+    if ($stmt_check_enrollment->fetchColumn() > 0) {
+        throw new Exception("Vous êtes déjà inscrit à cette formation.");
+    }
+
+    // Début de la transaction
+    $pdo->beginTransaction();
+
+    // Insérer l'inscription dans la table 'enrollments'
+    // Le statut initial de l'inscription est 'Pending' (en attente de paiement/confirmation)
+    // Le statut de paiement initial est également 'Pending'
+    $stmt_enrollment = $pdo->prepare("INSERT INTO enrollments (user_id, formation_id, enrollment_datetime, status, payment_status, notes) VALUES (:user_id, :formation_id, NOW(), 'Pending', 'Pending', :notes)");
+    $stmt_enrollment->bindParam(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt_enrollment->bindParam(':formation_id', $formation_id, PDO::PARAM_INT);
+    $stmt_enrollment->bindParam(':notes', $message, PDO::PARAM_STR);
+
+    if (!$stmt_enrollment->execute()) {
+        throw new Exception("Erreur lors de l'enregistrement de votre inscription.");
+    }
+
+    $enrollment_id = $pdo->lastInsertId(); // Récupérer l'ID de l'inscription nouvellement créée
+
+    // Mettre à jour le training_id de l'utilisateur si c'est la première inscription ou si la politique le permet
+    // C'est une hypothèse basée sur 'dashboard.php' où user.training_id est lié à t.training_id
+    // Si un utilisateur peut s'inscrire à plusieurs formations, cette logique doit être revue.
+    // Pour l'instant, je suppose qu'un utilisateur est "assigné" à une formation principale.
+    $stmt_update_user_training = $pdo->prepare("UPDATE users SET training_id = :formation_id WHERE id = :user_id");
+    $stmt_update_user_training->bindParam(':formation_id', $formation_id, PDO::PARAM_INT);
+    $stmt_update_user_training->bindParam(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt_update_user_training->execute();
+
+
+    $pdo->commit(); // Confirmer la transaction
+
+    $_SESSION['success_message'] = "Votre inscription à la formation a été enregistrée avec succès ! Un montant de " . number_format($formation_price, 2, ',', ' ') . " CFA est dû.";
+    $redirect_url = "my_enrollments.php"; // Rediriger vers la page des inscriptions de l'utilisateur
+
+} catch (PDOException $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    $_SESSION['error_message'] = "Une erreur de base de données est survenue : " . $e->getMessage();
+    // En production, ne pas afficher $e->getMessage() directement
+} catch (Exception $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    $_SESSION['error_message'] = $e->getMessage();
+} finally {
+    header("Location: " . $redirect_url);
+    exit();
+}
+?>
